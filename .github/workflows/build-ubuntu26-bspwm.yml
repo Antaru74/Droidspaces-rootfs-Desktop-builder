@@ -94,7 +94,7 @@ jobs:
 
           # ---------- GPU / Mesa (kgsl untuk Adreno) ----------
           RUN apt-get update && apt-get install -y --no-install-recommends \
-                mesa-utils libgl1-mesa-dri libegl1-mesa \
+                mesa-utils libgl1-mesa-dri libegl-mesa0 \
                 libgles2 libgbm1 \
                 vulkan-tools \
                 wayland-utils \
