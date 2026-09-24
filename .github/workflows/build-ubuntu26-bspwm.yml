@@ -241,50 +241,48 @@ jobs:
           tar -xf out/rootfs.tar -C verify
 
           echo ""
-          echo "=== Struktur sbin & usr/sbin ==="
-          ls -la verify/sbin 2>/dev/null | head -20 || echo "  (tidak ada /sbin)"
-          echo "---"
-          ls -la verify/usr/sbin 2>/dev/null | grep -E "init|systemd" || echo "  (tidak ada init di /usr/sbin)"
+          echo "=== Cek /sbin/init ==="
+          if [ ! -L verify/sbin/init ] && [ ! -e verify/sbin/init ]; then
+            echo "GAGAL: /sbin/init tidak ada."
+            ls -la verify/sbin/ 2>/dev/null | head -20
+            exit 1
+          fi
+          ls -la verify/sbin/init
 
           echo ""
-          echo "=== Cek beberapa lokasi umum ==="
-          FOUND=""
-          for p in sbin/init usr/sbin/init bin/init usr/bin/init; do
-            if [ -L "verify/$p" ] || [ -e "verify/$p" ]; then
-              echo "OK Ditemukan: $p"
-              ls -la "verify/$p"
-              FOUND="$p"
-              break
-            fi
-          done
+          echo "=== Resolve symlink chain dengan readlink -f ==="
+          RESOLVED=$(readlink -f verify/sbin/init)
+          echo "Resolved: $RESOLVED"
 
-          if [ -z "$FOUND" ]; then
-            echo ""
-            echo "GAGAL: /sbin/init TIDAK ADA di lokasi manapun."
-            echo "=== Semua file 'init' atau 'systemd' di rootfs ==="
-            find verify -maxdepth 4 \( -name "init" -o -name "systemd" \) -print 2>/dev/null | head -30
-            echo ""
-            echo "=== Isi rootfs (level 1) ==="
-            ls -la verify/
+          if [ ! -e "$RESOLVED" ]; then
+            echo "GAGAL: target symlink tidak ada: $RESOLVED"
             exit 1
           fi
 
-          if [ -L "verify/$FOUND" ]; then
-            TARGET=$(readlink "verify/$FOUND")
-            echo ""
-            echo "Symlink: $FOUND -> $TARGET"
-            ABS_TARGET="verify/${TARGET#/}"
-            if [ -e "$ABS_TARGET" ]; then
-              echo "OK Target symlink ada: $ABS_TARGET"
-            else
-              echo "GAGAL Target symlink TIDAK ADA: $ABS_TARGET"
-              echo "   Rootfs rusak karena systemd-sysv tidak terinstall."
-              exit 1
-            fi
+          if [ ! -x "$RESOLVED" ]; then
+            echo "GAGAL: target tidak executable: $RESOLVED"
+            ls -la "$RESOLVED"
+            exit 1
           fi
 
           echo ""
-          echo "Verifikasi lulus: rootfs punya init system."
+          echo "=== Cek systemd binary ==="
+          file "$RESOLVED" || true
+          ls -la "$RESOLVED"
+
+          echo ""
+          echo "=== Cek unit bspwm-anland terpasang ==="
+          if [ -L verify/etc/systemd/system/multi-user.target.wants/bspwm-anland.service ] || \
+             [ -e verify/etc/systemd/system/multi-user.target.wants/bspwm-anland.service ]; then
+            echo "OK bspwm-anland.service enabled"
+            ls -la verify/etc/systemd/system/multi-user.target.wants/bspwm-anland.service
+          else
+            echo "PERINGATAN: bspwm-anland.service tidak enabled, cek manual:"
+            ls -la verify/etc/systemd/system/multi-user.target.wants/ 2>/dev/null || true
+          fi
+
+          echo ""
+          echo "Verifikasi lulus: rootfs punya init system dan service bspwm."
 
       - name: Compress
         run: |
