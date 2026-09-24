@@ -46,18 +46,13 @@ jobs:
             *) echo "Unknown arch"; exit 1 ;;
           esac
 
-      - name: Debug — cek ketersediaan paket
-        run: |
-          docker run --rm --platform ${{ steps.plat.outputs.platform }} ubuntu:26.04 \
-            bash -c "apt-get update -qq && apt-cache policy systemd-sysv systemd libpam-systemd libegl-mesa0 bspwm sxhkd weston | head -60"
-
       - name: Write Dockerfile
         run: |
           cat > Dockerfile <<'DOCKERFILE_EOF'
           # ============================================================
-          # Ubuntu 26.04 + bspwm nested in Anland Next session
-          # anland-session = producer Anland (rootless Xwayland + mini-wm)
-          # bspwm          = window manager, jalan DI DALAM Xwayland itu
+          # Ubuntu 26.04 + bspwm + Anland Next
+          # anland-session: D-Bus + Wayland link + rootless Xwayland + mini-wm
+          # bspwm: window manager X11, berjalan DI DALAM Xwayland anland-session
           # ============================================================
           FROM ubuntu:26.04 AS rootfs
 
@@ -65,31 +60,30 @@ jobs:
           ENV LANG=en_US.UTF-8
           ENV LC_ALL=en_US.UTF-8
 
-          # ---------- Base system + systemd (WAJIB untuk Droidspaces) ----------
+          # ---------- Base system + systemd ----------
           RUN apt-get update && apt-get install -y --no-install-recommends \
                 bash coreutils util-linux procps findutils grep sed gawk \
-                ca-certificates curl wget gnupg xz-utils \
+                ca-certificates curl wget gnupg xz-utils jq \
                 tzdata locales sudo nano less vim-tiny \
-                dbus dbus-x11 \
+                dbus dbus-x11 dbus-user-session \
                 systemd systemd-sysv libpam-systemd \
                 apt-utils \
               && rm -rf /var/lib/apt/lists/* \
               && locale-gen en_US.UTF-8
 
-          # Verifikasi /sbin/init
           RUN ls -la /sbin/init && \
               readlink -f /sbin/init && \
               test -x "$(readlink -f /sbin/init)"
 
-          # ---------- X11 + bspwm stack ----------
+          # ---------- X11 + bspwm stack + Xwayland ----------
           RUN apt-get update && apt-get install -y --no-install-recommends \
                 bspwm sxhkd \
+                xwayland \
                 x11-xserver-utils x11-utils x11-xkb-utils xauth \
                 xterm xdotool wmctrl xclip \
-                picom \
-                feh \
-                rofi \
+                picom feh rofi \
                 xdg-user-dirs xdg-utils \
+                polkitd upower \
               && rm -rf /var/lib/apt/lists/*
 
           # ---------- Fonts ----------
@@ -99,28 +93,73 @@ jobs:
 
           # ---------- Audio (PipeWire) ----------
           RUN apt-get update && apt-get install -y --no-install-recommends \
-                pipewire pipewire-pulse wireplumber \
-                pulseaudio-utils \
+                pipewire pipewire-pulse wireplumber pulseaudio-utils \
               && rm -rf /var/lib/apt/lists/*
 
           # ---------- GPU / Mesa (kgsl untuk Adreno) ----------
           RUN apt-get update && apt-get install -y --no-install-recommends \
                 mesa-utils libgl1-mesa-dri libegl-mesa0 \
                 libgles2 libgbm1 \
-                vulkan-tools \
-                wayland-utils \
+                vulkan-tools wayland-utils \
               && rm -rf /var/lib/apt/lists/*
 
-          # ---------- Install anland-session dari droidspaces-package ----------
-          # anland-session menyediakan: socket link, rootless Xwayland, mini-wm
-          # Ganti URL di bawah sesuai release terbaru dari:
-          # https://github.com/Goldzxcbug/droidspaces-package/releases
-          ARG ANLAND_SESSION_URL="https://github.com/Goldzxcbug/droidspaces-package/releases/latest/download/anland-next-ubuntu26-arm64.tar.gz"
-          RUN curl -fsSL "$ANLAND_SESSION_URL" -o /tmp/anland-session.tar.gz && \
-              tar -xzf /tmp/anland-session.tar.gz -C / && \
-              rm /tmp/anland-session.tar.gz && \
-              test -x /usr/bin/anland-session && \
-              echo "anland-session installed OK"
+          # ============================================================
+          # Install anland-session dari droidspaces-package
+          # Referensi: scripts/tui/install-anland-next.sh
+          # ============================================================
+          RUN set -eux; \
+              REPO="Goldzxcbug/droidspaces-package"; \
+              TAG="anland-session-packages"; \
+              MANIFEST="anland-session-manifest"; \
+              TARGET_KEY="ubuntu2604"; \
+              BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"; \
+              \
+              echo "=== Unduh manifest ==="; \
+              curl -fsSL --retry 3 --retry-all-errors \
+                "${BASE_URL}/${MANIFEST}" -o /tmp/manifest; \
+              echo "--- isi manifest ---"; \
+              cat /tmp/manifest; \
+              echo "--------------------"; \
+              \
+              echo "=== Parse nama paket ==="; \
+              PACKAGE_NAME="$(awk -F= -v key="$TARGET_KEY" \
+                '$1 == key { print substr($0, index($0, "=") + 1) }' /tmp/manifest)"; \
+              echo "Package: $PACKAGE_NAME"; \
+              test -n "$PACKAGE_NAME"; \
+              \
+              echo "=== Unduh paket .deb ==="; \
+              curl -fsSL --retry 3 --retry-all-errors \
+                "${BASE_URL}/${PACKAGE_NAME}" -o /tmp/anland-session.deb; \
+              ls -lh /tmp/anland-session.deb; \
+              \
+              echo "=== Install via apt (resolve deps) ==="; \
+              cd /tmp; \
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                --allow-downgrades --allow-change-held-packages \
+                "./anland-session.deb"; \
+              \
+              echo "=== Verifikasi install ==="; \
+              dpkg-query -W -f='${db:Status-Status}' anland-session | grep -Fqx installed; \
+              test -x /usr/bin/anland-session; \
+              echo "anland-session installed OK"; \
+              rm -f /tmp/anland-session.deb /tmp/manifest
+
+          # ---------- Environment Anland ----------
+          RUN mkdir -p /run/user/0 /etc && \
+              chmod 700 /run/user/0 && \
+              cat > /etc/environment <<'ENVFILE'
+          XDG_RUNTIME_DIR=/run/user/0
+          XCURSOR_SIZE=48
+          XDG_SESSION_TYPE=wayland
+          WAYLAND_DISPLAY=wayland-anland
+          QT_QPA_PLATFORM=wayland
+          ANLAND=1
+          ANLAND_SOCKET=/run/display.sock
+          ANLAND_DRM_DEVICE=/dev/dri/renderD128
+          MESA_LOADER_DRIVER_OVERRIDE=kgsl
+          GALLIUM_DRIVER=kgsl
+          FD_FORCE_KGSL=1
+          ENVFILE
 
           # ---------- bspwm config ----------
           RUN mkdir -p /root/.config/bspwm /root/.config/sxhkd && \
@@ -156,24 +195,10 @@ jobs:
               bspc layout -d ^{tiled,monocle,spiral}
           SXHKD
 
-          # ---------- Environment Anland ----------
-          RUN cat > /etc/environment <<'ENVFILE'
-          XDG_RUNTIME_DIR=/run/user/0
-          XCURSOR_SIZE=48
-          WAYLAND_DISPLAY=wayland-0
-          QT_QPA_PLATFORM=wayland
-          ANLAND=1
-          ANLAND_SOCKET=/run/display.sock
-          ANLAND_DRM_DEVICE=/dev/dri/renderD128
-          MESA_LOADER_DRIVER_OVERRIDE=kgsl
-          GALLIUM_DRIVER=kgsl
-          FD_FORCE_KGSL=1
-          ENVFILE
-
           # ---------- Service 1: anland-session (producer Anland) ----------
           RUN cat > /etc/systemd/system/anland-session.service <<'UNIT'
           [Unit]
-          Description=Anland Next Session (rootless Xwayland producer)
+          Description=Anland Next Session (rootless Xwayland + mini-wm)
           After=network.target dbus.service
           Wants=dbus.service
 
@@ -182,7 +207,8 @@ jobs:
           Environment=HOME=/root
           Environment=XDG_RUNTIME_DIR=/run/user/0
           Environment=XCURSOR_SIZE=48
-          Environment=WAYLAND_DISPLAY=wayland-0
+          Environment=XDG_SESSION_TYPE=wayland
+          Environment=WAYLAND_DISPLAY=wayland-anland
           Environment=QT_QPA_PLATFORM=wayland
           Environment=ANLAND=1
           Environment=ANLAND_SOCKET=/run/display.sock
@@ -190,6 +216,8 @@ jobs:
           Environment=MESA_LOADER_DRIVER_OVERRIDE=kgsl
           Environment=GALLIUM_DRIVER=kgsl
           Environment=FD_FORCE_KGSL=1
+          ExecStartPre=/bin/mkdir -p /run/user/0
+          ExecStartPre=/bin/chmod 700 /run/user/0
           ExecStart=/usr/bin/anland-session
           Restart=on-failure
           RestartSec=3
@@ -198,7 +226,7 @@ jobs:
           WantedBy=multi-user.target
           UNIT
 
-          RUN systemctl enable anland-session.service 2>/dev/null || \
+          RUN mkdir -p /etc/systemd/system/multi-user.target.wants && \
               ln -sf /etc/systemd/system/anland-session.service \
                      /etc/systemd/system/multi-user.target.wants/anland-session.service
 
@@ -208,34 +236,37 @@ jobs:
           set -euo pipefail
 
           export XDG_RUNTIME_DIR=/run/user/0
-          export DISPLAY=:0
           export HOME=/root
           export MESA_LOADER_DRIVER_OVERRIDE=kgsl
           export GALLIUM_DRIVER=kgsl
           export FD_FORCE_KGSL=1
 
-          # Tunggu Xwayland dari anland-session (maks 90 detik)
-          for i in $(seq 1 180); do
-              if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
-                  echo "[bspwm-nested] Xwayland ready on $DISPLAY"
-                  break
-              fi
-              sleep 0.5
+          # Coba beberapa display yang mungkin disediakan anland-session
+          DETECTED_DISPLAY=""
+          for d in :0 :1 :2 :3; do
+              for i in $(seq 1 60); do
+                  if xdpyinfo -display "$d" >/dev/null 2>&1; then
+                      DETECTED_DISPLAY="$d"
+                      echo "[bspwm-nested] Xwayland ready on $DETECTED_DISPLAY"
+                      break 2
+                  fi
+                  sleep 0.5
+              done
           done
 
-          if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+          if [ -z "$DETECTED_DISPLAY" ]; then
               echo "[bspwm-nested] FATAL: Xwayland dari anland-session tidak muncul."
               echo "Cek: systemctl status anland-session"
               echo "     journalctl -u anland-session -n 100"
               exit 1
           fi
 
-          # Jalankan bspwm di dalam Xwayland milik anland-session
+          export DISPLAY="$DETECTED_DISPLAY"
           exec bspwm -c /root/.config/bspwm/bspwmrc
           SESSION
           RUN chmod +x /usr/local/bin/bspwm-nested-session
 
-          # ---------- Service 2: bspwm nested (depends on anland-session) ----------
+          # ---------- Service 2: bspwm nested ----------
           RUN cat > /etc/systemd/system/bspwm-nested.service <<'UNIT'
           [Unit]
           Description=bspwm nested in Anland Next Xwayland
@@ -246,7 +277,6 @@ jobs:
           [Service]
           Type=simple
           Environment=HOME=/root
-          Environment=DISPLAY=:0
           Environment=XDG_RUNTIME_DIR=/run/user/0
           Environment=MESA_LOADER_DRIVER_OVERRIDE=kgsl
           Environment=GALLIUM_DRIVER=kgsl
@@ -259,8 +289,7 @@ jobs:
           WantedBy=multi-user.target
           UNIT
 
-          RUN systemctl enable bspwm-nested.service 2>/dev/null || \
-              ln -sf /etc/systemd/system/bspwm-nested.service \
+          RUN ln -sf /etc/systemd/system/bspwm-nested.service \
                      /etc/systemd/system/multi-user.target.wants/bspwm-nested.service
 
           # ---------- Cleanup ----------
@@ -281,10 +310,7 @@ jobs:
 
           sed -i 's/^          //' Dockerfile
           echo "=== Dockerfile preview ==="
-          head -40 Dockerfile
-          echo "..."
-          echo "=== Cek service anland-session & bspwm ==="
-          grep -n "anland-session\|bspwm-nested\|libegl-mesa0\|/sbin/init" Dockerfile
+          head -50 Dockerfile
 
       - name: Build rootfs
         run: |
@@ -305,40 +331,37 @@ jobs:
           echo "=== Cek /sbin/init ==="
           if [ ! -L verify/sbin/init ] && [ ! -e verify/sbin/init ]; then
             echo "GAGAL: /sbin/init tidak ada."
-            ls -la verify/sbin/ 2>/dev/null | head -20
             exit 1
           fi
-          ls -la verify/sbin/init
-
-          echo ""
-          echo "=== Resolve symlink chain ==="
           RESOLVED=$(readlink -f verify/sbin/init)
           echo "Resolved: $RESOLVED"
-          if [ ! -e "$RESOLVED" ]; then
-            echo "GAGAL: target symlink tidak ada: $RESOLVED"
-            exit 1
-          fi
           if [ ! -x "$RESOLVED" ]; then
             echo "GAGAL: target tidak executable: $RESOLVED"
             exit 1
           fi
-          echo "OK systemd binary:"
-          ls -la "$RESOLVED"
+          echo "OK systemd binary"
 
           echo ""
           echo "=== Cek anland-session binary ==="
           if [ ! -x verify/usr/bin/anland-session ]; then
-            echo "GAGAL: /usr/bin/anland-session tidak ada atau tidak executable."
-            echo "Isi /usr/bin yang mengandung 'anland':"
+            echo "GAGAL: /usr/bin/anland-session tidak ada."
             ls -la verify/usr/bin/ 2>/dev/null | grep -i anland || echo "  (tidak ada)"
             exit 1
           fi
           ls -la verify/usr/bin/anland-session
 
           echo ""
+          echo "=== Cek Xwayland ==="
+          if [ ! -x verify/usr/bin/Xwayland ]; then
+            echo "PERINGATAN: Xwayland tidak di /usr/bin, cek lokasi lain:"
+            find verify -name "Xwayland" -type f 2>/dev/null | head -5
+          else
+            ls -la verify/usr/bin/Xwayland
+          fi
+
+          echo ""
           echo "=== Cek service anland-session ==="
-          if [ -L verify/etc/systemd/system/multi-user.target.wants/anland-session.service ] || \
-             [ -e verify/etc/systemd/system/multi-user.target.wants/anland-session.service ]; then
+          if [ -L verify/etc/systemd/system/multi-user.target.wants/anland-session.service ]; then
             echo "OK anland-session.service enabled"
           else
             echo "PERINGATAN: anland-session.service tidak enabled"
@@ -346,8 +369,7 @@ jobs:
 
           echo ""
           echo "=== Cek service bspwm-nested ==="
-          if [ -L verify/etc/systemd/system/multi-user.target.wants/bspwm-nested.service ] || \
-             [ -e verify/etc/systemd/system/multi-user.target.wants/bspwm-nested.service ]; then
+          if [ -L verify/etc/systemd/system/multi-user.target.wants/bspwm-nested.service ]; then
             echo "OK bspwm-nested.service enabled"
           else
             echo "PERINGATAN: bspwm-nested.service tidak enabled"
